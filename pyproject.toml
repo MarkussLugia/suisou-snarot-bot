@@ -1,0 +1,9 @@
+[project]
+name = "suisou-slugbot-kook"
+version = "0.1.0"
+requires-python = "~=3.10.0"
+dependencies = [
+    "khl-py>=0.3.17",
+    "pydantic>=2.14.1",
+    "requests>=2.34.2",
+]
