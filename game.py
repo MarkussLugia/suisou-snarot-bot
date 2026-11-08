@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from functools import partial
 from random import randint, shuffle
 from typing import Generic, Literal, TypeVar, cast
@@ -213,20 +214,22 @@ class SnarotGameTower:
         return self.__collapsing.draw(count)
 
 
+FieldColor = Literal["r", "g", "b", "y"]
+FieldNumber = Literal[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+
+
 class SnarotGameField:
-    color: Literal["r", "g", "b", "y"]
-    number: Literal[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    color: FieldColor
+    number: FieldNumber
 
     def shuffle(self):
-        self.color = cast(
-            Literal["r", "g", "b", "y"], ["r", "g", "b", "y"][randint(0, 3)]
-        )
-        self.number = cast(Literal[1, 2, 3, 4, 5, 6, 7, 8, 9, 10], randint(1, 10))
+        self.color = cast(FieldColor, ["r", "g", "b", "y"][randint(0, 3)])
+        self.number = cast(FieldNumber, randint(1, 10))
 
     def __init__(
         self,
-        color: Literal["r", "g", "b", "y"] | None = None,
-        number: Literal[1, 2, 3, 4, 5, 6, 7, 8, 9, 10] | None = None,
+        color: FieldColor | None = None,
+        number: FieldNumber | None = None,
     ):
         self.shuffle()
         if color is not None:
@@ -256,7 +259,29 @@ class NotInTurnException(InvalidException):
 
 
 class NeedColorPickException(Exception):
-    pass
+    index: int
+    card: SnarotCard
+
+    def __init__(self, index: int, card: SnarotCard):
+        self.index = index
+        self.card = card
+
+
+@dataclass(frozen=True)
+class FieldSnapshot:
+    field_color: FieldColor
+    field_number: FieldNumber
+    collapsing: bool
+
+
+@dataclass(frozen=True)
+class TurnSnapshot:
+    player_id: str
+    hand: list[SnarotCard]
+    usable: list[int]
+    draw_hold: int
+    draw_delay: int
+    field: FieldSnapshot
 
 
 class SnarotBotHooks:
@@ -266,13 +291,24 @@ class SnarotBotHooks:
     游戏在触发特定事件时，会调用对应方法。
     """
 
-    def on_draw(self, player_id: str, cards: list[SnarotCard]) -> None:
+    def on_draw(
+        self,
+        player_id: str,
+        cards: list[SnarotCard],
+        type: Literal["deal", "pass", "collapse", "attack", "self_draw"],
+        # 开局发牌，过牌，巨塔崩塌，预言抽牌，预言自身抽牌
+    ) -> None:
         """
-        某位玩家被派发卡牌。
+        某位玩家被派发卡牌。type 指定派发的原因。
         Bot 向玩家私聊被派发的卡牌列表。
         """
 
-    def on_play(self, player_id: str, card: SnarotCard | None) -> None:
+    def on_play(
+        self,
+        player_id: str,
+        card: SnarotCard | None,
+        field: FieldSnapshot,
+    ) -> None:
         """
         某位玩家行动。如果玩家没有打出卡牌，则 card 为 None。
         Bot 向群聊公告玩家的行动。
@@ -285,11 +321,7 @@ class SnarotBotHooks:
         """
 
     def on_turn_start(
-        self,
-        player_id: str,
-        hand: list[SnarotCard],
-        field: SnarotGameField,
-        tower: SnarotGameTower,
+        self, player_id: str, turn: TurnSnapshot, turn_count: int, turn_timeout: int
     ) -> None:
         """
         轮到某位玩家。
@@ -302,7 +334,7 @@ class SnarotBotHooks:
         Bot 向玩家私聊通知。
         """
 
-    def on_need_color_pick(self, player_id: str) -> None:
+    def on_need_color_pick(self, player_id: str, index: int, card: SnarotCard) -> None:
         """
         玩家准备打出需要选择场地颜色的卡牌。
         Bot 向玩家私聊提示选色。
@@ -346,13 +378,6 @@ class SnarotGameBase:
 
     hooks: SnarotBotHooks
 
-    __turn_count: int = 0
-    __pending_select_color: tuple[int, int] | None
-
-    @property
-    def turn_count(self) -> int:
-        return self.__turn_count
-
     def __init__(self, hooks: SnarotBotHooks):
         self.players = SnarotGamePlayerManager()
         self.tower = SnarotGameTower()
@@ -362,7 +387,7 @@ class SnarotGameBase:
 
         self.hooks = hooks
 
-    def __player_precheck(self, player_id: str) -> SnarotPlayer:
+    def _player_precheck(self, player_id: str) -> SnarotPlayer:
         player = self.players.get_player(player_id)
         if player is None:
             raise PlayerInvalidException("错误：玩家不在对局内。")
@@ -384,8 +409,10 @@ class SnarotGameBase:
     def __run_card(
         self,
         card: SnarotCard,
-        selected_color: Literal["r", "g", "b", "y"] | None = None,
-    ):
+        selected_color: FieldColor | None = None,
+    ) -> list[Callable[[], None]]:
+
+        change_hooks = []
 
         if card.reverse:
             self.players.reverse()
@@ -405,14 +432,18 @@ class SnarotGameBase:
         if card.selfDraw > 0:
             drawed = self._pack_draw(card.selfDraw)
             curr_player.deck.extend(drawed)
-            self.hooks.on_draw(curr_player.id, drawed)
+            change_hooks.append(
+                partial(self.hooks.on_draw, curr_player.id, drawed, "self_draw")
+            )
         if card.disable:
             next_player.skip = True
         next_player.draw_hold = card.attackDraw
         next_player.draw_delay = card.attackDelay + 1
         if card.collapse:
+            change_hooks.append(self.hooks.on_collapse)
             self.tower.start_collapse()
-            self.hooks.on_collapse()
+
+        return change_hooks
 
     def __player_enter_turn(self, player: SnarotPlayer):
         if player.skip:
@@ -424,11 +455,10 @@ class SnarotGameBase:
             if player.draw_delay == 0 and player.draw_hold > 0:
                 drawed = self._pack_draw(player.draw_hold)
                 player.deck.extend(drawed)
-                self.hooks.on_draw(player.id, drawed)
+                self.hooks.on_draw(player.id, drawed, "attack")
                 player.draw_hold = 0
 
     def __proceed(self):
-        self.__turn_count += 1
         self.players.proceed()
         self.__player_enter_turn(self.players.get_current_player())
 
@@ -448,83 +478,104 @@ class SnarotGameBase:
         for player in self.players:
             cards = self._pack_draw(deck_size)
             player.deck.extend(cards)
-            self.hooks.on_draw(player.id, cards)
+            self.hooks.on_draw(player.id, cards, "deal")
 
-    def list_usable_cards(self, player_id: str) -> list[int]:
-        player = self.__player_precheck(player_id)
+    def _get_field_snapshot(self) -> FieldSnapshot:
+        return FieldSnapshot(
+            field_color=self.field.color,
+            field_number=self.field.number,
+            collapsing=self.tower.collapsing,
+        )
+
+    def _get_turn_snapshot(self, player: SnarotPlayer) -> TurnSnapshot:
+        return TurnSnapshot(
+            player_id=player.id,
+            hand=player.deck[:],
+            usable=self._list_usable_cards(player),
+            draw_hold=player.draw_hold,
+            draw_delay=player.draw_delay,
+            field=self._get_field_snapshot(),
+        )
+
+    def _list_usable_cards(self, player: SnarotPlayer) -> list[int]:
         return [
             index
             for index, card in enumerate(player.deck)
             if self.__check_card_usable(card, player)
         ]
 
-    def select_color(self, player_id: str, selected_color: Literal["r", "g", "b", "y"]):
-        self.__player_precheck(player_id)
-        if self.__pending_select_color is None:
-            raise InvalidException("目前不需要指定颜色。")
-        (pending_index, pending_turn_count) = self.__pending_select_color
-        self.__pending_select_color = None
-        if pending_turn_count != self.turn_count:
-            raise InvalidException("目前不需要指定颜色。")
-        self.play_card(player_id, pending_index, selected_color)
-
     def play_card(
         self,
         player_id: str,
         card_index: int,
-        selected_color: Literal["r", "g", "b", "y"] | None = None,
+        selected_color: FieldColor | None = None,
     ):
-        player = self.__player_precheck(player_id)
+        player = self._player_precheck(player_id)
         try:
             card = player.get_card(card_index)
         except IndexError:
             raise CardInvalidException("请指定数字范围内的卡牌。")
         if not self.__check_card_usable(card, player):
             raise CardInvalidException("此卡牌现在不能打出。")
-        self.__pending_select_color = None
         if card.updateColor == "s" and selected_color is None:
-            self.__pending_select_color = (card_index, self.turn_count)
-            raise NeedColorPickException()
+            raise NeedColorPickException(card_index, card)
 
-        self.__run_card(card, selected_color)
+        changes = self.__run_card(card, selected_color)
         if card.addToTower:
             self.tower.add_to_tower(card)
         else:
             self.card_disposal.append(card)
         player.delete_card(card_index)
-        self.hooks.on_play(player.id, card)
+
+        self.hooks.on_play(player.id, card, self._get_field_snapshot())
+        for hook in changes:
+            hook()
 
         self.__proceed()
 
     def pass_turn(self, player_id: str):
-        player = self.__player_precheck(player_id)
-        self.__pending_select_color = None
+        player = self._player_precheck(player_id)
         if self.tower.collapsing:
             drawed = self.tower.get_collapse()
             player.deck.extend(drawed)
+            self.hooks.on_draw(player.id, drawed, "collapse")
         else:
             drawed = self._pack_draw(1)
             player.deck.extend(drawed)
-        self.hooks.on_draw(player.id, drawed)
-        self.hooks.on_play(player.id, None)
+            self.hooks.on_draw(player.id, drawed, "pass")
+        self.hooks.on_play(player.id, None, self._get_field_snapshot())
 
         self.__proceed()
 
 
 class SnarotGame(SnarotGameBase):
-    turn_timeout: int = 60
-    pending_events: list[asyncio.Event]
+    turn_timeout: int = 0
+    __timeout_task: asyncio.Task | None
 
     started: bool = False
     winners: list[str]
+
+    __turn_count: int = 0
+    __pending_select_color: tuple[int, int] | None
+
+    @property
+    def turn_count(self) -> int:
+        return self.__turn_count
 
     @property
     def ended(self) -> bool:
         # return self.started and len(self.players) <= 1
         return len(self.winners) > 0
 
-    def __init__(self, hooks: SnarotBotHooks):
-        self.pending_events = []
+    def __init__(self, hooks: SnarotBotHooks, turn_timeout: int = 0):
+        self.__timeout_task = None
+        if turn_timeout > 0:
+            try:
+                asyncio.get_running_loop()
+                self.turn_timeout = turn_timeout
+            except RuntimeError:
+                print("无法使用回合超时功能，请在 asyncio 上下文中运行。")
+                print("回合超时将不会触发。")
         self.winners = []
         super().__init__(hooks)
 
@@ -535,33 +586,51 @@ class SnarotGame(SnarotGameBase):
             self.players.remove_player_preserve_order(winner.id)
             self.hooks.on_player_win(winner.id)
 
-    async def __begin_player(self, player: SnarotPlayer):
-        for pending_event in self.pending_events:
-            pending_event.set()
-        self.pending_events = []
-
+    def __begin_player(self, player: SnarotPlayer):
         self.__check_winner()
         if self.ended:
             # self.hooks.on_game_over(self.winners)
+            self.__cancel_timeout()
             return
 
-        turn_count = self.turn_count
-        timeout_event = asyncio.Event()
-        self.pending_events.append(timeout_event)
-        self.hooks.on_turn_start(player.id, player.deck[:], self.field, self.tower)
-        try:
-            await asyncio.wait_for(timeout_event.wait(), timeout=self.turn_timeout)
-        except asyncio.TimeoutError:
-            if not self.ended and self.turn_count == turn_count:
-                self.hooks.on_turn_timeout(player.id)
-                await self.handle_pass(player.id)
+        turn_count = self.__turn_count + 1
+        self.__turn_count = turn_count
 
-    async def handle_prepare(self, player_id: str):
+        self.__cancel_timeout()
+        if self.turn_timeout > 0:
+            self.__timeout_task = asyncio.create_task(
+                self.__timeout_checker(player.id, turn_count)
+            )
+
+        self.hooks.on_turn_start(
+            player.id,
+            self._get_turn_snapshot(player),
+            self.turn_count,
+            self.turn_timeout,
+        )
+
+    async def __timeout_checker(self, player_id: str, turn_count: int):
+        try:
+            await asyncio.sleep(self.turn_timeout)
+        except asyncio.CancelledError:
+            return
+        if not self.ended and self.turn_count == turn_count:
+            self.__timeout_task = None
+            self.hooks.on_turn_timeout(player_id)
+            self.handle_pass(player_id)
+
+    def __cancel_timeout(self) -> None:
+        task = self.__timeout_task
+        if task is not None and not task.done():
+            task.cancel()
+        self.__timeout_task = None
+
+    def handle_prepare(self, player_id: str):
         player = self.players.get_player(player_id)
         if player is not None:
             player.ready = True
 
-    async def handle_start_game(self, deck_size: int = 7):
+    def handle_start_game(self, deck_size: int = 7):
         if self.started:
             return
         if len(self.players) < 2:
@@ -576,11 +645,11 @@ class SnarotGame(SnarotGameBase):
             return
         self._deal(deck_size)
         self.started = True
-        await self.__begin_player(self.players.get_current_player())
+        self.__begin_player(self.players.get_current_player())
 
     # 回合循环逻辑
 
-    async def __round_handler(self, player_id: str, action: Callable[[], None]) -> None:
+    def __round_handler(self, player_id: str, action: Callable[[], None]) -> None:
         if not self.started:
             self.hooks.on_private_message(player_id, "游戏还没有开始哦")
             return
@@ -588,33 +657,43 @@ class SnarotGame(SnarotGameBase):
             return
         try:
             action()
-            await self.__begin_player(self.players.get_current_player())
-        except NeedColorPickException:
-            self.hooks.on_need_color_pick(player_id)
+            self.__pending_select_color = None
+            self.__begin_player(self.players.get_current_player())
+        except NeedColorPickException as e:
+            self.__pending_select_color = (e.index, self.turn_count)
+            self.hooks.on_need_color_pick(player_id, e.index, e.card)
         except InvalidException as e:
             self.hooks.on_private_message(player_id, e.message)
 
-    async def handle_pass(self, player_id: str):
-        await self.__round_handler(player_id, partial(self.pass_turn, player_id))
+    def handle_pass(self, player_id: str):
+        self.__round_handler(player_id, partial(self.pass_turn, player_id))
 
-    async def handle_play(
+    def handle_play(
         self,
         player_id: str,
         card_index: int,
-        selected_color: Literal["r", "g", "b", "y"] | None = None,
+        selected_color: FieldColor | None = None,
     ):
-        await self.__round_handler(
+        self.__round_handler(
             player_id, partial(self.play_card, player_id, card_index, selected_color)
         )
 
-    async def handle_select_color(
-        self, player_id: str, selected_color: Literal["r", "g", "b", "y"]
-    ):
-        await self.__round_handler(
+    def select_color(self, player_id: str, selected_color: FieldColor):
+        self._player_precheck(player_id)
+        if self.__pending_select_color is None:
+            raise InvalidException("目前不需要指定颜色。")
+        (pending_index, pending_turn_count) = self.__pending_select_color
+        self.__pending_select_color = None
+        if pending_turn_count != self.turn_count:
+            raise InvalidException("目前不需要指定颜色。")
+        self.play_card(player_id, pending_index, selected_color)
+
+    def handle_select_color(self, player_id: str, selected_color: FieldColor):
+        self.__round_handler(
             player_id, partial(self.select_color, player_id, selected_color)
         )
 
-    async def handle_add_player(self, player_id: str) -> bool:
+    def handle_add_player(self, player_id: str) -> bool:
         if not self.started:
             try:
                 self.players.add_player(player_id)
@@ -627,7 +706,7 @@ class SnarotGame(SnarotGameBase):
             self.hooks.on_group_message("游戏已开始，不能加入")
             return False
 
-    async def handle_remove_player(self, player_id: str):
+    def handle_remove_player(self, player_id: str):
         if not self.started:
             try:
                 self.players.remove_player(player_id)
