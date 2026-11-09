@@ -185,6 +185,10 @@ class SnarotGamePlayerManager:
                 return player
         return None
 
+    def get_rank(self) -> list[tuple[str, int]]:
+        decks_len = [(player.id, len(player.deck)) for player in self.__players]
+        return sorted(decks_len, key=lambda x: x[1])
+
     def __len__(self):
         return len(self.__players)
 
@@ -340,16 +344,19 @@ class SnarotBotHooks:
         Bot 向玩家私聊提示选色。
         """
 
-    def on_player_win(self, player_id: str) -> None:
+    def on_player_win(self, player_id: str, rank: list[tuple[str, int]]) -> None:
         """
         某位玩家打完了手牌，取得胜利。
-        Bot 向群聊公告胜者。
+        Bot 向群聊公告胜者和玩家按手牌数量的排名。
         """
 
-    def on_game_over(self, winners: list[str]) -> None:
+    def on_draw_exceeded_end(
+        self, draw_count: int, rank: list[tuple[str, int]]
+    ) -> None:
         """
-        游戏结束并进行兜底结算。TODO: 这个功能之后实现。
-        Bot 向群聊公告胜者列表。
+        从牌库中抽取的卡牌张数达到设定的结束数量，
+        游戏结束。
+        Bot 向群聊公告玩家按手牌数量的排名。
         """
 
     def on_not_ready(self, player_ids: list[str]) -> None:
@@ -375,6 +382,8 @@ class SnarotGameBase:
     field: SnarotGameField
     card_pack: CardPile[SnarotCard]
     card_disposal: CardPile[SnarotCard]
+
+    drawn_count: int = 0
 
     hooks: SnarotBotHooks
 
@@ -472,6 +481,7 @@ class SnarotGameBase:
             if not drawn:
                 break
             result.extend(drawn)
+        self.drawn_count += len(result)
         return result
 
     def _deal(self, deck_size: int):
@@ -552,8 +562,10 @@ class SnarotGame(SnarotGameBase):
     turn_timeout: int = 0
     __timeout_task: asyncio.Task | None
 
+    max_drawn_count: int
+
     started: bool = False
-    winners: list[str]
+    ended: bool = False
 
     __turn_count: int = 0
     __pending_select_color: tuple[int, int] | None
@@ -562,13 +574,11 @@ class SnarotGame(SnarotGameBase):
     def turn_count(self) -> int:
         return self.__turn_count
 
-    @property
-    def ended(self) -> bool:
-        # return self.started and len(self.players) <= 1
-        return len(self.winners) > 0
-
-    def __init__(self, hooks: SnarotBotHooks, turn_timeout: int = 0):
+    def __init__(
+        self, hooks: SnarotBotHooks, turn_timeout: int = 0, max_drawn_count: int = 80
+    ):
         self.__timeout_task = None
+        self.max_drawn_count = max_drawn_count
         if turn_timeout > 0:
             try:
                 asyncio.get_running_loop()
@@ -576,20 +586,20 @@ class SnarotGame(SnarotGameBase):
             except RuntimeError:
                 print("无法使用回合超时功能，请在 asyncio 上下文中运行。")
                 print("回合超时将不会触发。")
-        self.winners = []
         super().__init__(hooks)
 
     def __check_winner(self):
         winner = self.players.get_winner()
         if winner is not None:
-            self.winners.append(winner.id)
-            self.players.remove_player_preserve_order(winner.id)
-            self.hooks.on_player_win(winner.id)
+            self.ended = True
+            self.hooks.on_player_win(winner.id, self.players.get_rank())
+        elif self.drawn_count >= self.max_drawn_count:
+            self.ended = True
+            self.hooks.on_draw_exceeded_end(self.drawn_count, self.players.get_rank())
 
     def __begin_player(self, player: SnarotPlayer):
         self.__check_winner()
         if self.ended:
-            # self.hooks.on_game_over(self.winners)
             self.__cancel_timeout()
             return
 
@@ -625,6 +635,10 @@ class SnarotGame(SnarotGameBase):
             task.cancel()
         self.__timeout_task = None
 
+    def force_shutdown(self) -> None:
+        self.ended = True
+        self.__cancel_timeout()
+
     def handle_prepare(self, player_id: str):
         player = self.players.get_player(player_id)
         if player is not None:
@@ -648,7 +662,6 @@ class SnarotGame(SnarotGameBase):
         self.__begin_player(self.players.get_current_player())
 
     # 回合循环逻辑
-
     def __round_handler(self, player_id: str, action: Callable[[], None]) -> None:
         if not self.started:
             self.hooks.on_private_message(player_id, "游戏还没有开始哦")
