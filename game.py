@@ -387,13 +387,16 @@ class SnarotGameBase:
 
     hooks: SnarotBotHooks
 
-    def __init__(self, hooks: SnarotBotHooks):
+    def __init__(self, hooks: SnarotBotHooks | None = None):
         self.players = SnarotGamePlayerManager()
         self.tower = SnarotGameTower()
         self.field = SnarotGameField()
         self.card_pack = CardPile()
         self.card_disposal = CardPile()
 
+        self.hooks = hooks if hooks is not None else SnarotBotHooks()
+
+    def attach_hooks(self, hooks: SnarotBotHooks):
         self.hooks = hooks
 
     def _player_precheck(self, player_id: str) -> SnarotPlayer:
@@ -575,7 +578,10 @@ class SnarotGame(SnarotGameBase):
         return self.__turn_count
 
     def __init__(
-        self, hooks: SnarotBotHooks, turn_timeout: int = 0, max_drawn_count: int = 80
+        self,
+        hooks: SnarotBotHooks | None = None,
+        turn_timeout: int = 0,
+        max_drawn_count: int = 80,
     ):
         self.__timeout_task = None
         self.max_drawn_count = max_drawn_count
