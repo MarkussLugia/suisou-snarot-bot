@@ -1,8 +1,9 @@
-import time
 from typing import Literal
 
-import requests
 from pydantic import BaseModel
+from requests import JSONDecodeError
+
+from shared import retryable_get
 
 
 class SnarotJSONCardData(BaseModel):
@@ -46,20 +47,11 @@ class SnarotJSON(BaseModel):
 
 def get_data_from_json(
     url: str,
-    conn_timeout: float = 5,
-    read_timeout: float = 15,
-    total_attempts: int = 3,
-    retry_delay: float = 0.5,
 ) -> SnarotJSON:
-    for attempt in range(1, total_attempts + 1):
-        try:
-            response = requests.get(url, timeout=(conn_timeout, read_timeout))
-            return SnarotJSON.model_validate(response.json())
-        except (requests.RequestException, requests.HTTPError, ValueError) as e:
-            print(f"获取 {url} 失败：{type(e).__name__}")
-            print(e)
-            print(f"第 {attempt}/{total_attempts} 次，{retry_delay:.1f}s 后重试")
-            if attempt < total_attempts:
-                time.sleep(retry_delay)
-
-    raise RuntimeError("无法获取卡牌列表。")
+    try:
+        response = retryable_get(url, read_timeout=15)
+        return SnarotJSON.model_validate(response.json())
+    except (ValueError, JSONDecodeError):
+        raise RuntimeError("卡牌列表读取失败：卡牌列表 JSON 文件格式有问题。")
+    except RuntimeError:
+        raise RuntimeError("卡牌列表读取失败：网络故障。")
