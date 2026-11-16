@@ -18,6 +18,7 @@ from game import (
     SnarotCard,
     SnarotGame,
     TurnSnapshot,
+    WinningState,
 )
 from shared import format_exception
 
@@ -224,40 +225,26 @@ class AutoPlayerDispatcher(SnarotBotHooks, AutoPlayerHooks):
             auto_player.notify_turn(turn, turn_count)
         self.game_hook_sink.on_turn_start(player_id, turn, turn_count, turn_timeout)
 
-    def on_player_win(self, player_id: str, rank: list[tuple[str, int]]) -> None:
-        self.game_hook_sink.on_player_win(player_id, rank)
-        self.cancel_all()
-
-    def on_draw_exceeded_end(
-        self, draw_count: int, rank: list[tuple[str, int]]
-    ) -> None:
-        self.game_hook_sink.on_draw_exceeded_end(draw_count, rank)
-        self.cancel_all()
-
     def on_draw(
         self,
         player_id: str,
         cards: list[SnarotCard],
         type: DrawReason,
+        is_timeout: bool = False,
     ) -> None:
-        self.game_hook_sink.on_draw(player_id, cards, type)
+        self.game_hook_sink.on_draw(player_id, cards, type, is_timeout)
 
     def on_play(
-        self, player_id: str, card: SnarotCard | None, field: FieldSnapshot
+        self,
+        player_id: str,
+        card: SnarotCard | None,
+        field: FieldSnapshot,
+        winning_state: WinningState,
     ) -> None:
-        self.game_hook_sink.on_play(player_id, card, field)
-
-    def on_collapse(self) -> None:
-        self.game_hook_sink.on_collapse()
-
-    def on_turn_timeout(self, player_id: str) -> None:
-        self.game_hook_sink.on_turn_timeout(player_id)
+        self.game_hook_sink.on_play(player_id, card, field, winning_state)
 
     def on_need_color_pick(self, player_id: str, index: int, card: SnarotCard) -> None:
         self.game_hook_sink.on_need_color_pick(player_id, index, card)
-
-    def on_not_ready(self, player_ids: list[str]) -> None:
-        self.game_hook_sink.on_not_ready(player_ids)
 
     def on_group_message(self, text: str) -> None:
         self.game_hook_sink.on_group_message(text)

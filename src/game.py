@@ -1,11 +1,12 @@
 import asyncio
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from dataclasses import dataclass
 from functools import partial
 from random import randint, shuffle
 from typing import Generic, Literal, TypeVar, cast
 
 from data import SnarotJSONCardData
+from shared import format_exception
 
 
 class SnarotCard:
@@ -112,10 +113,11 @@ class SnarotGamePlayerManager:
             index += 1
         return index % len(self.__players)
 
-    def shuffle(self):
+    def shuffle(self) -> list[str]:
         shuffle(self.__players)
         self.__current_index = 0
         self.__is_reverse = False
+        return [player.id for player in self.__players]
 
     def add_player(self, player_id: str):
         if player_id in self.__player_map:
@@ -288,6 +290,18 @@ class TurnSnapshot:
     field: FieldSnapshot
 
 
+WinningState = (
+    tuple[Literal[0], None, None]
+    | tuple[Literal[1], str, list[tuple[str, int]]]
+    | tuple[Literal[2], int, list[tuple[str, int]]]
+)
+"""
+0: 游戏还未结束。
+1: 某位玩家打完了手牌，获得胜利
+2: 发牌数量达到上限，游戏结束
+"""
+
+
 class SnarotBotHooks:
     """
     Hooks 类
@@ -301,9 +315,11 @@ class SnarotBotHooks:
         cards: list[SnarotCard],
         type: Literal["deal", "pass", "collapse", "attack", "self_draw"],
         # 开局发牌，过牌，巨塔崩塌，预言抽牌，预言自身抽牌
+        is_timeout: bool = False,
     ) -> None:
         """
         某位玩家被派发卡牌。type 指定派发的原因。
+        is_timeout 表示本次属于超时过牌。
         Bot 向玩家私聊被派发的卡牌列表。
         """
 
@@ -312,16 +328,12 @@ class SnarotBotHooks:
         player_id: str,
         card: SnarotCard | None,
         field: FieldSnapshot,
+        winning_state: WinningState,
     ) -> None:
         """
         某位玩家行动。如果玩家没有打出卡牌，则 card 为 None。
         Bot 向群聊公告玩家的行动。
-        """
-
-    def on_collapse(self) -> None:
-        """
-        巨塔开始崩塌。
-        Bot 向群聊公告。
+        如果有人胜利，则公布胜利情况。
         """
 
     def on_turn_start(
@@ -332,37 +344,10 @@ class SnarotBotHooks:
         Bot 向玩家私聊当前的手牌与场地信息。
         """
 
-    def on_turn_timeout(self, player_id: str) -> None:
-        """
-        某位玩家行动超时，回落到默认行动。
-        Bot 向玩家私聊通知。
-        """
-
     def on_need_color_pick(self, player_id: str, index: int, card: SnarotCard) -> None:
         """
         玩家准备打出需要选择场地颜色的卡牌。
         Bot 向玩家私聊提示选色。
-        """
-
-    def on_player_win(self, player_id: str, rank: list[tuple[str, int]]) -> None:
-        """
-        某位玩家打完了手牌，取得胜利。
-        Bot 向群聊公告胜者和玩家按手牌数量的排名。
-        """
-
-    def on_draw_exceeded_end(
-        self, draw_count: int, rank: list[tuple[str, int]]
-    ) -> None:
-        """
-        从牌库中抽取的卡牌张数达到设定的结束数量，
-        游戏结束。
-        Bot 向群聊公告玩家按手牌数量的排名。
-        """
-
-    def on_not_ready(self, player_ids: list[str]) -> None:
-        """
-        仍有玩家未准备好时，尝试开始游戏。
-        Bot 向群聊通知还未准备好的玩家列表。
         """
 
     def on_group_message(self, text: str) -> None:
@@ -422,9 +407,7 @@ class SnarotGameBase:
         self,
         card: SnarotCard,
         selected_color: FieldColor | None = None,
-    ) -> list[Callable[[], None]]:
-
-        change_hooks = []
+    ):
 
         if card.reverse:
             self.players.reverse()
@@ -444,18 +427,13 @@ class SnarotGameBase:
         if card.selfDraw > 0:
             drawed = self._pack_draw(card.selfDraw)
             curr_player.deck.extend(drawed)
-            change_hooks.append(
-                partial(self.hooks.on_draw, curr_player.id, drawed, "self_draw")
-            )
+            self.hooks.on_draw(curr_player.id, drawed, "self_draw")
         if card.disable:
             next_player.skip = True
         next_player.draw_hold = card.attackDraw
         next_player.draw_delay = card.attackDelay + 1
         if card.collapse:
-            change_hooks.append(self.hooks.on_collapse)
             self.tower.start_collapse()
-
-        return change_hooks
 
     def __player_enter_turn(self, player: SnarotPlayer):
         if player.skip:
@@ -522,7 +500,7 @@ class SnarotGameBase:
         player_id: str,
         card_index: int,
         selected_color: FieldColor | None = None,
-    ):
+    ) -> SnarotCard:
         player = self._player_precheck(player_id)
         try:
             card = player.get_card(card_index)
@@ -533,37 +511,32 @@ class SnarotGameBase:
         if card.updateColor == "s" and selected_color is None:
             raise NeedColorPickException(card_index, card)
 
-        changes = self.__run_card(card, selected_color)
+        self.__run_card(card, selected_color)
         if card.addToTower:
             self.tower.add_to_tower(card)
         else:
             self.card_disposal.append(card)
         player.delete_card(card_index)
-
-        self.hooks.on_play(player.id, card, self._get_field_snapshot())
-        for hook in changes:
-            hook()
-
         self.__proceed()
+        return card
 
-    def pass_turn(self, player_id: str):
+    def pass_turn(self, player_id: str, is_timeout: bool):
         player = self._player_precheck(player_id)
         if self.tower.collapsing:
             drawed = self.tower.get_collapse()
             player.deck.extend(drawed)
-            self.hooks.on_draw(player.id, drawed, "collapse")
+            self.hooks.on_draw(player.id, drawed, "collapse", is_timeout)
         else:
             drawed = self._pack_draw(1)
             player.deck.extend(drawed)
-            self.hooks.on_draw(player.id, drawed, "pass")
-        self.hooks.on_play(player.id, None, self._get_field_snapshot())
-
+            self.hooks.on_draw(player.id, drawed, "pass", is_timeout)
         self.__proceed()
 
 
 class SnarotGame(SnarotGameBase):
     turn_timeout: int = 0
     __timeout_task: asyncio.Task | None
+    __begin_task: asyncio.Task | None
 
     max_drawn_count: int
 
@@ -584,27 +557,45 @@ class SnarotGame(SnarotGameBase):
         max_drawn_count: int = 80,
     ):
         self.__timeout_task = None
+        self.__begin_task = None
         self.max_drawn_count = max_drawn_count
-        if turn_timeout > 0:
-            try:
-                asyncio.get_running_loop()
-                self.turn_timeout = turn_timeout
-            except RuntimeError:
-                print("无法使用回合超时功能，请在 asyncio 上下文中运行。")
-                print("回合超时将不会触发。")
+        self.turn_timeout = turn_timeout
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            raise RuntimeError("请在 asyncio 上下文中初始化 SnarotGame")
         super().__init__(hooks)
 
-    def __check_winner(self):
+    def __check_winner(
+        self,
+    ) -> WinningState:
         winner = self.players.get_winner()
         if winner is not None:
             self.ended = True
-            self.hooks.on_player_win(winner.id, self.players.get_rank())
+            return (1, winner.id, self.players.get_rank())
         elif self.drawn_count >= self.max_drawn_count:
             self.ended = True
-            self.hooks.on_draw_exceeded_end(self.drawn_count, self.players.get_rank())
+            return (2, self.drawn_count, self.players.get_rank())
+        else:
+            return (0, None, None)
 
-    def __begin_player(self, player: SnarotPlayer):
-        self.__check_winner()
+    # 下一回合开始
+    def __sche_begin_current_player(self):
+        player = self.players.get_current_player()
+        task = asyncio.create_task(self.__begin_player(player))
+        self.__begin_task = task
+        task.add_done_callback(partial(self.__begin_done, player.id))
+
+    # __begin_player 结束错误处理
+    def __begin_done(self, player_id: str, task: asyncio.Task) -> None:
+        err_str = format_exception(task)
+        if err_str:
+            print(f"内部错误：玩家 {player_id} 的回合推进出现错误：")
+            print(err_str)
+        if self.__begin_task is task:
+            self.__begin_task = None
+
+    async def __begin_player(self, player: SnarotPlayer):
         if self.ended:
             self.__cancel_timeout()
             return
@@ -632,8 +623,7 @@ class SnarotGame(SnarotGameBase):
             return
         if not self.ended and self.turn_count == turn_count:
             self.__timeout_task = None
-            self.hooks.on_turn_timeout(player_id)
-            self.handle_pass(player_id)
+            self.handle_pass(player_id, True)
 
     def __cancel_timeout(self) -> None:
         task = self.__timeout_task
@@ -645,47 +635,95 @@ class SnarotGame(SnarotGameBase):
         self.ended = True
         self.__cancel_timeout()
 
-    def handle_prepare(self, player_id: str):
+    def handle_prepare(self, player_id: str) -> Literal[0, 1, 2]:
+        """
+        玩家准备。
+        returns: return_code
+        0: 成功
+        1: 玩家已经处于准备状态
+        2: 玩家不存在（内部错误）
+        """
         player = self.players.get_player(player_id)
-        if player is not None:
+        if player is None:
+            return 2
+        elif player.ready:
+            return 1
+        else:
             player.ready = True
+            return 0
 
-    def handle_start_game(self, deck_size: int = 7):
+    def handle_start_game(
+        self, deck_size: int = 7
+    ) -> (
+        tuple[Literal[0], list[str]]
+        | tuple[Literal[1], None]
+        | tuple[Literal[2], None]
+        | tuple[Literal[3], None]
+        | tuple[Literal[4], list[str]]
+    ):
+        """
+        开始游戏。
+        returns: tuple[return_code, (player_id_list)]
+        0: 成功（玩家顺序）
+        1: 游戏已经处于开始状态
+        2: 玩家人数不足
+        3: 卡牌数量不足
+        4: 有玩家未准备（未准备的玩家）
+        """
         if self.started:
-            return
-        if len(self.players) < 2:
-            self.hooks.on_group_message("玩家的人数不足，无法开始游戏")
-            return
+            return (1, None)
+        if len(self.players) < 3:
+            return (2, None)
+        if len(self.card_pack) < len(self.players) * deck_size + 1:
+            return (3, None)
         not_ready = self.players.get_not_ready()
         if len(not_ready) > 0:
-            self.hooks.on_not_ready(not_ready)
-            return
-        if len(self.card_pack) < len(self.players) * deck_size:
-            self.hooks.on_group_message("牌库中的卡牌数量不足，无法开始游戏")
-            return
+            return (4, not_ready)
         self._deal(deck_size)
         self.started = True
-        self.__begin_player(self.players.get_current_player())
+        order = self.players.shuffle()
+        self.__sche_begin_current_player()
+        return (0, order)
 
     # 回合循环逻辑
-    def __round_handler(self, player_id: str, action: Callable[[], None]) -> None:
+    def __round_handler(
+        self,
+        player_id: str,
+        action: tuple[Literal["play"], int, FieldColor | None]
+        | tuple[Literal["pass"], bool]
+        | tuple[Literal["color"], FieldColor],
+    ) -> None:
         if not self.started:
             self.hooks.on_private_message(player_id, "游戏还没有开始哦")
             return
         if self.ended:
             return
         try:
-            action()
+            card: SnarotCard | None = None
+            match action[0]:
+                case "play":
+                    card = self.play_card(player_id, *action[1:])
+                case "pass":
+                    self.pass_turn(player_id, *action[1:])
+                case "color":
+                    card = self.select_color(player_id, *action[1:])
             self.__pending_select_color = None
-            self.__begin_player(self.players.get_current_player())
+            field_snap = self._get_field_snapshot()
+            winning_state = self.__check_winner()
+            self.hooks.on_play(player_id, card, field_snap, winning_state)
+            if winning_state[0] == 0:
+                self.__sche_begin_current_player()
+            else:
+                self.__cancel_timeout()
+
         except NeedColorPickException as e:
             self.__pending_select_color = (e.index, self.turn_count)
             self.hooks.on_need_color_pick(player_id, e.index, e.card)
         except InvalidException as e:
             self.hooks.on_private_message(player_id, e.message)
 
-    def handle_pass(self, player_id: str):
-        self.__round_handler(player_id, partial(self.pass_turn, player_id))
+    def handle_pass(self, player_id: str, is_timeout: bool = False):
+        self.__round_handler(player_id, ("pass", is_timeout))
 
     def handle_play(
         self,
@@ -693,11 +731,9 @@ class SnarotGame(SnarotGameBase):
         card_index: int,
         selected_color: FieldColor | None = None,
     ):
-        self.__round_handler(
-            player_id, partial(self.play_card, player_id, card_index, selected_color)
-        )
+        self.__round_handler(player_id, ("play", card_index, selected_color))
 
-    def select_color(self, player_id: str, selected_color: FieldColor):
+    def select_color(self, player_id: str, selected_color: FieldColor) -> SnarotCard:
         self._player_precheck(player_id)
         if self.__pending_select_color is None:
             raise InvalidException("目前不需要指定颜色。")
@@ -705,12 +741,10 @@ class SnarotGame(SnarotGameBase):
         self.__pending_select_color = None
         if pending_turn_count != self.turn_count:
             raise InvalidException("目前不需要指定颜色。")
-        self.play_card(player_id, pending_index, selected_color)
+        return self.play_card(player_id, pending_index, selected_color)
 
     def handle_select_color(self, player_id: str, selected_color: FieldColor):
-        self.__round_handler(
-            player_id, partial(self.select_color, player_id, selected_color)
-        )
+        self.__round_handler(player_id, ("color", selected_color))
 
     def handle_add_player(self, player_id: str) -> bool:
         if not self.started:
